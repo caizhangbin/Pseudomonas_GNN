@@ -1,0 +1,20 @@
+name: chem_gnn
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - pandas
+  - numpy
+  - scikit-learn
+  - rdkit
+  - pytorch
+  - ipython
+  - pytorch-cuda=12.1
+  - pip
+
+  - pip:
+      - torch-geometric
