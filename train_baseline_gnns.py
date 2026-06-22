@@ -2,9 +2,10 @@
 
 import argparse
 import json
+import math
 import os
 import random
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 
 import pandas as pd
 import torch
@@ -25,7 +26,47 @@ from torch_geometric.nn import (
 def set_seed(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def to_jsonable(obj):
+    """
+    Convert numpy/pandas/torch scalar values into JSON-safe Python objects.
+    """
+    if isinstance(obj, dict):
+        return {str(k): to_jsonable(v) for k, v in obj.items()}
+
+    if isinstance(obj, list):
+        return [to_jsonable(v) for v in obj]
+
+    if isinstance(obj, tuple):
+        return [to_jsonable(v) for v in obj]
+
+    if isinstance(obj, torch.Tensor):
+        if obj.numel() == 1:
+            return obj.item()
+        return obj.detach().cpu().tolist()
+
+    if hasattr(obj, "item"):
+        try:
+            return obj.item()
+        except Exception:
+            pass
+
+    try:
+        if pd.isna(obj):
+            return None
+    except Exception:
+        pass
+
+    return obj
+
+
+def save_metrics_json(metrics, output_path):
+    with open(output_path, "w") as f:
+        json.dump(to_jsonable(metrics), f, indent=2)
 
 
 def load_graphs(path: str):
@@ -38,24 +79,157 @@ def load_graphs(path: str):
     cleaned = []
     skipped = 0
 
-    for g in graphs:
+    for idx, g in enumerate(graphs):
         if not hasattr(g, "x") or not hasattr(g, "edge_index") or not hasattr(g, "y"):
             skipped += 1
             continue
 
-        g.x = g.x.float()
+        try:
+            g.x = g.x.float()
 
-        if hasattr(g, "edge_attr") and g.edge_attr is not None:
-            g.edge_attr = g.edge_attr.float()
+            if g.x.dim() == 1:
+                g.x = g.x.view(-1, 1)
 
-        g.y = g.y.long().view(-1)
+            if g.x.dim() != 2:
+                print(f"Skipping graph {idx}: x must be 2D, got shape {tuple(g.x.shape)}")
+                skipped += 1
+                continue
 
-        cleaned.append(g)
+            if g.edge_index.dim() != 2 or g.edge_index.shape[0] != 2:
+                print(
+                    f"Skipping graph {idx}: edge_index must have shape [2, num_edges], "
+                    f"got {tuple(g.edge_index.shape)}"
+                )
+                skipped += 1
+                continue
+
+            if hasattr(g, "edge_attr") and g.edge_attr is not None:
+                g.edge_attr = g.edge_attr.float()
+
+                if g.edge_attr.dim() == 1 and g.edge_attr.numel() > 0:
+                    g.edge_attr = g.edge_attr.view(-1, 1)
+
+                if g.edge_attr.dim() not in [1, 2]:
+                    print(
+                        f"Skipping graph {idx}: edge_attr must be 1D or 2D, "
+                        f"got shape {tuple(g.edge_attr.shape)}"
+                    )
+                    skipped += 1
+                    continue
+
+            g.y = g.y.long().view(-1)
+
+            if g.y.numel() != 1:
+                print(f"Skipping graph {idx}: expected one label, got {g.y.numel()}")
+                skipped += 1
+                continue
+
+            cleaned.append(g)
+
+        except Exception as e:
+            print(f"Skipping graph {idx} due to error: {e}")
+            skipped += 1
+
+    if len(cleaned) == 0:
+        raise ValueError("No valid graphs were loaded.")
 
     print(f"Loaded graphs: {len(cleaned)}")
     print(f"Skipped invalid graphs: {skipped}")
 
     return cleaned
+
+
+def infer_dimensions_and_validate_graphs(graphs: List):
+    """
+    Infer node_dim and edge_dim safely.
+
+    If some graphs have edge_attr and others do not, this function fills missing
+    edge_attr with zeros so PyG batching is consistent. This is useful for GCN/GIN
+    and allows GINE to run if edge features exist in the dataset.
+    """
+    first = graphs[0]
+    node_dim = first.x.shape[1]
+
+    for i, g in enumerate(graphs):
+        if g.x.dim() != 2:
+            raise ValueError(f"Graph {i} has invalid x shape: {tuple(g.x.shape)}")
+
+        if g.x.shape[1] != node_dim:
+            raise ValueError(
+                f"Graph {i} has node feature dim {g.x.shape[1]}, "
+                f"but expected {node_dim}."
+            )
+
+        if g.edge_index.dim() != 2 or g.edge_index.shape[0] != 2:
+            raise ValueError(
+                f"Graph {i} has invalid edge_index shape: {tuple(g.edge_index.shape)}"
+            )
+
+    edge_dims = set()
+
+    for g in graphs:
+        if hasattr(g, "edge_attr") and g.edge_attr is not None:
+            if g.edge_attr.dim() == 2:
+                edge_dims.add(g.edge_attr.shape[1])
+            elif g.edge_attr.dim() == 1 and g.edge_attr.numel() > 0:
+                edge_dims.add(1)
+
+    if len(edge_dims) == 0:
+        edge_dim = None
+    elif len(edge_dims) == 1:
+        edge_dim = list(edge_dims)[0]
+    else:
+        raise ValueError(f"Inconsistent edge_attr dimensions found: {edge_dims}")
+
+    filled_missing_edge_attr = 0
+
+    if edge_dim is not None:
+        for i, g in enumerate(graphs):
+            num_edges = int(g.edge_index.shape[1])
+
+            if not hasattr(g, "edge_attr") or g.edge_attr is None:
+                g.edge_attr = torch.zeros((num_edges, edge_dim), dtype=torch.float)
+                filled_missing_edge_attr += 1
+                continue
+
+            if g.edge_attr.dim() == 1:
+                if g.edge_attr.numel() == 0:
+                    g.edge_attr = torch.zeros((num_edges, edge_dim), dtype=torch.float)
+                    filled_missing_edge_attr += 1
+                else:
+                    g.edge_attr = g.edge_attr.view(-1, 1)
+
+            if g.edge_attr.dim() != 2:
+                raise ValueError(
+                    f"Graph {i} has invalid edge_attr shape: {tuple(g.edge_attr.shape)}"
+                )
+
+            if g.edge_attr.shape[1] != edge_dim:
+                raise ValueError(
+                    f"Graph {i} has edge feature dim {g.edge_attr.shape[1]}, "
+                    f"but expected {edge_dim}."
+                )
+
+            if g.edge_attr.shape[0] != num_edges:
+                raise ValueError(
+                    f"Graph {i} has {g.edge_attr.shape[0]} edge_attr rows, "
+                    f"but edge_index has {num_edges} edges."
+                )
+
+    if filled_missing_edge_attr > 0:
+        print(
+            f"Warning: filled missing edge_attr with zeros for "
+            f"{filled_missing_edge_attr} graphs."
+        )
+
+    return node_dim, edge_dim
+
+
+def count_labels(graphs):
+    labels = torch.tensor([int(g.y.item()) for g in graphs])
+    inactive = int((labels == 0).sum().item())
+    active = int((labels == 1).sum().item())
+    return inactive, active
 
 
 def stratified_split(
@@ -68,6 +242,12 @@ def stratified_split(
 
     inactive = [g for g in graphs if int(g.y.item()) == 0]
     active = [g for g in graphs if int(g.y.item()) == 1]
+
+    if len(inactive) == 0 or len(active) == 0:
+        raise ValueError(
+            f"Need both classes for stratified split. "
+            f"Found inactive={len(inactive)}, active={len(active)}."
+        )
 
     rng.shuffle(inactive)
     rng.shuffle(active)
@@ -206,6 +386,8 @@ class BaselineGNN(nn.Module):
 
         for conv, bn in zip(self.convs, self.batch_norms):
             if self.gnn_type == "GINE":
+                if edge_attr is None:
+                    raise ValueError("GINE received batch without edge_attr.")
                 x = conv(x, edge_index, edge_attr)
             else:
                 x = conv(x, edge_index)
@@ -309,8 +491,6 @@ def evaluate(model, loader, criterion, device, threshold: float = 0.50):
         loss = criterion(logits, y)
 
         probs = torch.softmax(logits, dim=1)[:, 1]
-
-        # This is where threshold adjustment happens
         preds = (probs >= threshold).long()
 
         total_loss += loss.item() * batch.num_graphs
@@ -334,7 +514,8 @@ def evaluate(model, loader, criterion, device, threshold: float = 0.50):
             metrics["roc_auc"] = None
             metrics["average_precision"] = None
 
-    except Exception:
+    except Exception as e:
+        print(f"Warning: sklearn metrics failed: {e}")
         metrics["roc_auc"] = None
         metrics["average_precision"] = None
 
@@ -356,9 +537,7 @@ def collect_predictions(model, loader, device):
         logits = model(batch)
         probs = torch.softmax(logits, dim=1)[:, 1]
 
-        # Default threshold of 0.50
         preds_default = (probs >= 0.50).long()
-
         y_true = batch.y.view(-1)
 
         for i in range(batch.num_graphs):
@@ -399,9 +578,12 @@ def collect_predictions(model, loader, device):
 def calculate_topk_metrics(pred_df, overall_active_rate, k_values=(100, 500, 1000)):
     """
     Precision@K = number of true actives in top K / K
+    Recall@K = number of true actives in top K / total true actives
     EF@K = Precision@K / overall active rate
     """
     rows = []
+
+    total_actives = int(pred_df["y_true"].sum())
 
     for k in k_values:
         if k > len(pred_df):
@@ -412,7 +594,7 @@ def calculate_topk_metrics(pred_df, overall_active_rate, k_values=(100, 500, 100
         true_actives = int(top_k["y_true"].sum())
 
         precision_at_k = true_actives / k
-        active_rate_in_top_k = precision_at_k
+        recall_at_k = true_actives / total_actives if total_actives > 0 else 0.0
 
         ef_at_k = (
             precision_at_k / overall_active_rate
@@ -424,23 +606,38 @@ def calculate_topk_metrics(pred_df, overall_active_rate, k_values=(100, 500, 100
             {
                 "K": k,
                 "true_actives_in_top_K": true_actives,
-                "active_rate_in_top_K": active_rate_in_top_k,
+                "total_actives": total_actives,
                 f"Precision@{k}": precision_at_k,
+                f"Recall@{k}": recall_at_k,
                 "overall_active_rate": overall_active_rate,
-                f"EF{k}": ef_at_k,
+                f"EF@{k}": ef_at_k,
             }
         )
 
     return pd.DataFrame(rows)
 
 
+def default_threshold_grid():
+    """
+    More useful threshold grid for imbalanced datasets.
+
+    The active rate is often very low, so include thresholds below 0.05.
+    """
+    low_thresholds = [0.001, 0.002, 0.005, 0.01, 0.02]
+    regular_thresholds = [round(i / 100, 2) for i in range(3, 100, 2)]
+
+    thresholds = sorted(set(low_thresholds + regular_thresholds))
+
+    return thresholds
+
+
 def threshold_sweep(pred_df, thresholds=None):
     """
-    Calculate precision, recall, F1, balanced accuracy, and confusion matrix values
-    across multiple probability thresholds.
+    Calculate precision, recall, F1, balanced accuracy, specificity,
+    and confusion matrix values across probability thresholds.
     """
     if thresholds is None:
-        thresholds = [round(i / 100, 2) for i in range(5, 100, 5)]
+        thresholds = default_threshold_grid()
 
     y_true = pred_df["y_true"].tolist()
     rows = []
@@ -469,10 +666,13 @@ def select_threshold_from_validation(
     Select threshold using validation set only.
 
     Default: choose threshold with highest validation F1.
-    You can also use:
+
+    Example:
       --threshold-selection-metric precision
       --min-recall-for-threshold 0.50
-    to choose the highest precision threshold while keeping recall >= 0.50.
+
+    This selects the threshold with highest precision among thresholds where
+    validation recall >= 0.50.
     """
     df = val_threshold_df.copy()
 
@@ -512,11 +712,6 @@ def save_confusion_matrix(metrics, output_path):
     return cm
 
 
-def save_metrics_json(metrics, output_path):
-    with open(output_path, "w") as f:
-        json.dump(metrics, f, indent=2)
-
-
 def save_ranking_outputs(
     model,
     loader,
@@ -524,12 +719,19 @@ def save_ranking_outputs(
     output_dir,
     prefix,
     overall_active_rate,
+    selected_threshold: Optional[float] = None,
 ):
     pred_df = collect_predictions(
         model=model,
         loader=loader,
         device=device,
     )
+
+    if selected_threshold is not None:
+        pred_df["selected_threshold"] = selected_threshold
+        pred_df["y_pred_selected_threshold"] = (
+            pred_df["prob_active"] >= selected_threshold
+        ).astype(int)
 
     ranked_predictions_path = os.path.join(
         output_dir,
@@ -595,18 +797,39 @@ def save_ranking_outputs(
     }
 
 
-def count_labels(graphs):
-    labels = torch.tensor([int(g.y.item()) for g in graphs])
-    inactive = int((labels == 0).sum().item())
-    active = int((labels == 1).sum().item())
-    return inactive, active
+def get_model_selection_score(metrics: Dict[str, Any], requested_metric: str):
+    """
+    Select best epoch using requested validation metric.
+
+    average_precision and roc_auc are threshold-independent.
+    If sklearn is unavailable or metric is None, fall back to balanced accuracy.
+    """
+    score = metrics.get(requested_metric)
+
+    if score is None:
+        return metrics["balanced_accuracy"], "balanced_accuracy"
+
+    if isinstance(score, float) and math.isnan(score):
+        return metrics["balanced_accuracy"], "balanced_accuracy"
+
+    return float(score), requested_metric
+
+
+def fmt_metric(value):
+    if value is None:
+        return "None"
+
+    try:
+        return f"{float(value):.4f}"
+    except Exception:
+        return str(value)
 
 
 def main():
     parser = argparse.ArgumentParser(
         description=(
             "Train baseline GNN using graph structure only. "
-            "Includes ranking metrics and threshold adjustment analysis."
+            "Includes Top-K ranking metrics and threshold adjustment analysis."
         )
     )
 
@@ -652,12 +875,30 @@ def main():
     )
 
     parser.add_argument(
+        "--model-selection-metric",
+        default="average_precision",
+        choices=[
+            "average_precision",
+            "roc_auc",
+            "balanced_accuracy",
+            "f1",
+            "precision",
+            "recall",
+            "specificity",
+        ],
+        help=(
+            "Validation metric used to select the best epoch. "
+            "Default: average_precision, which is useful for imbalanced datasets."
+        ),
+    )
+
+    parser.add_argument(
         "--threshold-selection-metric",
         default="f1",
         choices=["f1", "precision", "recall", "balanced_accuracy", "specificity"],
         help=(
-            "Metric used to select the best threshold on the validation set. "
-            "Default: f1."
+            "Metric used to select the best classification threshold on the "
+            "validation set. Default: f1."
         ),
     )
 
@@ -692,26 +933,28 @@ def main():
     print(f"Using device: {device}")
     print(f"GNN type: {args.gnn_type}")
     print(f"Pooling: {args.pooling}")
+    print(f"Model-selection metric: {args.model_selection_metric}")
+    print(f"Threshold-selection metric: {args.threshold_selection_metric}")
+    print(f"Minimum recall for threshold selection: {args.min_recall_for_threshold}")
 
     graphs = load_graphs(args.graphs)
+
+    node_dim, edge_dim = infer_dimensions_and_validate_graphs(graphs)
 
     inactive, active = count_labels(graphs)
 
     print(f"Number of graphs: {len(graphs)}")
     print(f"Inactive: {inactive}")
     print(f"Active: {active}")
-
-    first = graphs[0]
-
-    node_dim = first.x.shape[1]
-
-    if hasattr(first, "edge_attr") and first.edge_attr is not None and first.edge_attr.numel() > 0:
-        edge_dim = first.edge_attr.shape[1]
-    else:
-        edge_dim = None
-
+    print(f"Overall active rate: {active / len(graphs):.6f}")
     print(f"Node feature dim: {node_dim}")
     print(f"Edge feature dim: {edge_dim}")
+
+    if args.gnn_type == "GINE" and edge_dim is None:
+        raise ValueError(
+            "You selected GINE, but no edge_attr was found. "
+            "Use GCN/GIN or regenerate graphs with edge features."
+        )
 
     train_graphs, val_graphs, test_graphs = stratified_split(
         graphs,
@@ -731,6 +974,12 @@ def main():
     print(f"Train inactive/active: {train_inactive}/{train_active}")
     print(f"Val inactive/active: {val_inactive}/{val_active}")
     print(f"Test inactive/active: {test_inactive}/{test_active}")
+
+    if train_inactive == 0 or train_active == 0:
+        raise ValueError(
+            "Training split must contain both inactive and active samples. "
+            f"Found inactive={train_inactive}, active={train_active}."
+        )
 
     train_loader = DataLoader(
         train_graphs,
@@ -789,8 +1038,9 @@ def main():
             f"inactive={weight_inactive:.4f}, active={weight_active:.4f}"
         )
 
-    best_val_metric = -1.0
+    best_val_score = -1.0
     best_epoch = 0
+    best_metric_used = args.model_selection_metric
     history = []
 
     best_model_path = os.path.join(args.output, "best_model.pt")
@@ -807,7 +1057,6 @@ def main():
             device,
         )
 
-        # Training still uses threshold 0.50 for validation metric selection
         val_metrics = evaluate(
             model,
             val_loader,
@@ -816,19 +1065,26 @@ def main():
             threshold=0.50,
         )
 
-        val_score = val_metrics["balanced_accuracy"]
+        val_score, metric_used = get_model_selection_score(
+            val_metrics,
+            args.model_selection_metric,
+        )
 
         row = {
             "epoch": epoch,
             "train_loss": train_loss,
+            "model_selection_metric_requested": args.model_selection_metric,
+            "model_selection_metric_used": metric_used,
+            "model_selection_score": val_score,
             **{f"val_{k}": v for k, v in val_metrics.items()},
         }
 
         history.append(row)
 
-        if val_score > best_val_metric:
-            best_val_metric = val_score
+        if val_score > best_val_score:
+            best_val_score = val_score
             best_epoch = epoch
+            best_metric_used = metric_used
 
             torch.save(
                 {
@@ -837,7 +1093,9 @@ def main():
                     "node_dim": node_dim,
                     "edge_dim": edge_dim,
                     "best_epoch": best_epoch,
-                    "best_val_balanced_accuracy": best_val_metric,
+                    "model_selection_metric_requested": args.model_selection_metric,
+                    "model_selection_metric_used": best_metric_used,
+                    "best_val_score": best_val_score,
                 },
                 best_model_path,
             )
@@ -849,37 +1107,17 @@ def main():
             f"val_acc={val_metrics['accuracy']:.4f} | "
             f"val_bal_acc={val_metrics['balanced_accuracy']:.4f} | "
             f"val_f1={val_metrics['f1']:.4f} | "
+            f"val_precision={val_metrics['precision']:.4f} | "
             f"val_recall={val_metrics['recall']:.4f} | "
-            f"val_auc={val_metrics['roc_auc']}"
+            f"val_ap={fmt_metric(val_metrics['average_precision'])} | "
+            f"val_auc={fmt_metric(val_metrics['roc_auc'])} | "
+            f"selection_score={val_score:.4f}({metric_used})"
         )
 
     print("\nLoading best model for final evaluation...")
 
     checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
-
-    print("\nEvaluating test set at default threshold 0.50...")
-
-    test_metrics_default = evaluate(
-        model,
-        test_loader,
-        criterion,
-        device,
-        threshold=0.50,
-    )
-
-    print("\nSaving test ranking outputs...")
-
-    test_active_rate = test_active / len(test_graphs)
-
-    test_output_paths = save_ranking_outputs(
-        model=model,
-        loader=test_loader,
-        device=device,
-        output_dir=args.output,
-        prefix="test",
-        overall_active_rate=test_active_rate,
-    )
 
     print("\nRunning validation threshold sweep...")
 
@@ -921,7 +1159,17 @@ def main():
     save_metrics_json(selected_threshold_info, selected_threshold_info_path)
 
     print("\nSelected threshold from validation set:")
-    print(json.dumps(selected_threshold_info, indent=2))
+    print(json.dumps(to_jsonable(selected_threshold_info), indent=2))
+
+    print("\nEvaluating test set at default threshold 0.50...")
+
+    test_metrics_default = evaluate(
+        model,
+        test_loader,
+        criterion,
+        device,
+        threshold=0.50,
+    )
 
     print("\nApplying selected threshold to test set...")
 
@@ -949,10 +1197,24 @@ def main():
     )
 
     print("\nTest metrics using selected threshold:")
-    print(json.dumps(test_metrics_selected_threshold, indent=2))
+    print(json.dumps(to_jsonable(test_metrics_selected_threshold), indent=2))
 
     print("\nTest confusion matrix using selected threshold:")
     print(selected_test_confusion_matrix_df)
+
+    print("\nSaving test ranking outputs...")
+
+    test_active_rate = test_active / len(test_graphs)
+
+    test_output_paths = save_ranking_outputs(
+        model=model,
+        loader=test_loader,
+        device=device,
+        output_dir=args.output,
+        prefix="test",
+        overall_active_rate=test_active_rate,
+        selected_threshold=selected_threshold,
+    )
 
     full_dataset_output_paths = None
 
@@ -974,6 +1236,7 @@ def main():
             output_dir=args.output,
             prefix="full_dataset",
             overall_active_rate=full_active_rate,
+            selected_threshold=selected_threshold,
         )
 
     torch.save(
@@ -982,6 +1245,10 @@ def main():
             "args": vars(args),
             "node_dim": node_dim,
             "edge_dim": edge_dim,
+            "best_epoch": best_epoch,
+            "model_selection_metric_requested": args.model_selection_metric,
+            "model_selection_metric_used": best_metric_used,
+            "best_val_score": best_val_score,
             "test_metrics_default_threshold_0.50": test_metrics_default,
             "test_metrics_selected_threshold": test_metrics_selected_threshold,
             "selected_threshold": selected_threshold,
@@ -990,7 +1257,7 @@ def main():
     )
 
     with open(history_path, "w") as f:
-        json.dump(history, f, indent=2)
+        json.dump(to_jsonable(history), f, indent=2)
 
     summary = {
         "graphs": args.graphs,
@@ -1013,7 +1280,9 @@ def main():
         "test_active": test_active,
         "overall_active_rate_test_set": test_active_rate,
         "best_epoch": best_epoch,
-        "best_val_balanced_accuracy": best_val_metric,
+        "model_selection_metric_requested": args.model_selection_metric,
+        "model_selection_metric_used": best_metric_used,
+        "best_val_score": best_val_score,
         "test_metrics_default_threshold_0.50": test_metrics_default,
         "selected_threshold": selected_threshold,
         "selected_threshold_info_path": selected_threshold_info_path,
@@ -1029,7 +1298,7 @@ def main():
     }
 
     with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
+        json.dump(to_jsonable(summary), f, indent=2)
 
     print("\nDone.")
     print(f"Best model saved to: {best_model_path}")
@@ -1038,6 +1307,7 @@ def main():
     print(f"Summary saved to: {summary_path}")
 
     print("\nImportant output files:")
+    print(f"Test ranked predictions: {test_output_paths['ranked_predictions_path']}")
     print(f"Test Top-K metrics: {test_output_paths['topk_metrics_path']}")
     print(f"Test threshold sweep: {test_output_paths['threshold_metrics_path']}")
     print(f"Validation threshold sweep: {val_threshold_sweep_path}")
@@ -1046,6 +1316,7 @@ def main():
     print(f"Selected-threshold confusion matrix: {selected_test_confusion_matrix_path}")
 
     if full_dataset_output_paths is not None:
+        print(f"Full-dataset ranked predictions: {full_dataset_output_paths['ranked_predictions_path']}")
         print(f"Full-dataset Top-K metrics: {full_dataset_output_paths['topk_metrics_path']}")
 
 
