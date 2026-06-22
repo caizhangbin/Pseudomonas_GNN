@@ -1034,13 +1034,10 @@ def calculate_topk_metrics(
 
 
 def default_threshold_grid() -> List[float]:
-    """
-    Includes low thresholds for highly imbalanced datasets.
-    """
-    low_thresholds = [0.001, 0.002, 0.005]
-    regular_thresholds = [round(i / 100, 2) for i in range(1, 100)]
-
-    return sorted(set(low_thresholds + regular_thresholds))
+    very_low = [0.0005, 0.001, 0.002, 0.003, 0.005, 0.0075]
+    low = [round(i / 1000, 3) for i in range(10, 100)]  # 0.010 to 0.099
+    regular = [round(i / 100, 2) for i in range(10, 100)]  # 0.10 to 0.99
+    return sorted(set(very_low + low + regular))
 
 
 def threshold_sweep(
