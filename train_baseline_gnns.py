@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 import random
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import pandas as pd
 import torch
@@ -112,7 +112,7 @@ class BaselineGNN(nn.Module):
     def __init__(
         self,
         node_dim: int,
-        edge_dim: int,
+        edge_dim: Optional[int],
         hidden_dim: int = 128,
         num_layers: int = 3,
         dropout: float = 0.2,
@@ -234,6 +234,7 @@ def compute_basic_metrics(y_true, y_pred):
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+
     f1 = (
         2 * precision * recall / (precision + recall)
         if (precision + recall) > 0
@@ -282,7 +283,14 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, threshold: float = 0.50):
+    """
+    Evaluate model using a specified probability threshold.
+
+    threshold = 0.50 means:
+      prob_active >= 0.50 -> predicted active
+      prob_active < 0.50 -> predicted inactive
+    """
     model.eval()
 
     total_loss = 0.0
@@ -301,7 +309,9 @@ def evaluate(model, loader, criterion, device):
         loss = criterion(logits, y)
 
         probs = torch.softmax(logits, dim=1)[:, 1]
-        preds = torch.argmax(logits, dim=1)
+
+        # This is where threshold adjustment happens
+        preds = (probs >= threshold).long()
 
         total_loss += loss.item() * batch.num_graphs
         total_graphs += batch.num_graphs
@@ -312,6 +322,7 @@ def evaluate(model, loader, criterion, device):
 
     metrics = compute_basic_metrics(all_true, all_pred)
     metrics["loss"] = total_loss / total_graphs
+    metrics["threshold"] = threshold
 
     try:
         from sklearn.metrics import roc_auc_score, average_precision_score
@@ -333,13 +344,7 @@ def evaluate(model, loader, criterion, device):
 @torch.no_grad()
 def collect_predictions(model, loader, device):
     """
-    Collect predicted probabilities for each graph.
-
-    This is needed for:
-    - ranking compounds by predicted active probability
-    - Precision@K
-    - EF@K
-    - threshold sweep
+    Save y_true and prob_active for ranking and threshold analysis.
     """
     model.eval()
 
@@ -350,13 +355,16 @@ def collect_predictions(model, loader, device):
 
         logits = model(batch)
         probs = torch.softmax(logits, dim=1)[:, 1]
-        preds_default = torch.argmax(logits, dim=1)
+
+        # Default threshold of 0.50
+        preds_default = (probs >= 0.50).long()
+
         y_true = batch.y.view(-1)
 
         for i in range(batch.num_graphs):
             row = {
                 "y_true": int(y_true[i].cpu().item()),
-                "y_pred_default": int(preds_default[i].cpu().item()),
+                "y_pred_threshold_0.50": int(preds_default[i].cpu().item()),
                 "prob_active": float(probs[i].cpu().item()),
             }
 
@@ -397,14 +405,14 @@ def calculate_topk_metrics(pred_df, overall_active_rate, k_values=(100, 500, 100
 
     for k in k_values:
         if k > len(pred_df):
-            print(f"Skipping K={k} because there are only {len(pred_df)} predictions.")
+            print(f"Skipping K={k}; only {len(pred_df)} predictions available.")
             continue
 
         top_k = pred_df.head(k)
         true_actives = int(top_k["y_true"].sum())
 
         precision_at_k = true_actives / k
-        active_rate_top_k = precision_at_k
+        active_rate_in_top_k = precision_at_k
 
         ef_at_k = (
             precision_at_k / overall_active_rate
@@ -416,7 +424,7 @@ def calculate_topk_metrics(pred_df, overall_active_rate, k_values=(100, 500, 100
             {
                 "K": k,
                 "true_actives_in_top_K": true_actives,
-                "active_rate_in_top_K": active_rate_top_k,
+                "active_rate_in_top_K": active_rate_in_top_k,
                 f"Precision@{k}": precision_at_k,
                 "overall_active_rate": overall_active_rate,
                 f"EF{k}": ef_at_k,
@@ -428,15 +436,11 @@ def calculate_topk_metrics(pred_df, overall_active_rate, k_values=(100, 500, 100
 
 def threshold_sweep(pred_df, thresholds=None):
     """
-    Test different probability thresholds.
-
-    Example:
-    threshold = 0.50 means:
-      prob_active >= 0.50 -> active
-      prob_active < 0.50 -> inactive
+    Calculate precision, recall, F1, balanced accuracy, and confusion matrix values
+    across multiple probability thresholds.
     """
     if thresholds is None:
-        thresholds = [round(x, 2) for x in torch.arange(0.05, 1.00, 0.05).tolist()]
+        thresholds = [round(i / 100, 2) for i in range(5, 100, 5)]
 
     y_true = pred_df["y_true"].tolist()
     rows = []
@@ -456,13 +460,45 @@ def threshold_sweep(pred_df, thresholds=None):
     return pd.DataFrame(rows)
 
 
-def save_confusion_matrix(metrics, output_path):
+def select_threshold_from_validation(
+    val_threshold_df,
+    metric: str = "f1",
+    min_recall: float = 0.0,
+):
     """
-    Save confusion matrix in a readable layout.
+    Select threshold using validation set only.
 
-    Rows = actual class
-    Columns = predicted class
+    Default: choose threshold with highest validation F1.
+    You can also use:
+      --threshold-selection-metric precision
+      --min-recall-for-threshold 0.50
+    to choose the highest precision threshold while keeping recall >= 0.50.
     """
+    df = val_threshold_df.copy()
+
+    if min_recall > 0:
+        df = df[df["recall"] >= min_recall].copy()
+
+    if len(df) == 0:
+        print(
+            f"No threshold satisfied min_recall={min_recall}. "
+            "Using all thresholds instead."
+        )
+        df = val_threshold_df.copy()
+
+    if metric not in df.columns:
+        raise ValueError(
+            f"Metric '{metric}' not found in threshold dataframe. "
+            f"Available columns: {df.columns.tolist()}"
+        )
+
+    best_idx = df[metric].idxmax()
+    best_row = df.loc[best_idx]
+
+    return float(best_row["threshold"]), best_row.to_dict()
+
+
+def save_confusion_matrix(metrics, output_path):
     cm = pd.DataFrame(
         [
             [metrics["tn"], metrics["fp"]],
@@ -476,6 +512,11 @@ def save_confusion_matrix(metrics, output_path):
     return cm
 
 
+def save_metrics_json(metrics, output_path):
+    with open(output_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+
 def save_ranking_outputs(
     model,
     loader,
@@ -484,16 +525,16 @@ def save_ranking_outputs(
     prefix,
     overall_active_rate,
 ):
-    """
-    Save ranked predictions, Precision@K, EF@K, threshold sweep, and confusion matrix.
-    """
     pred_df = collect_predictions(
         model=model,
         loader=loader,
         device=device,
     )
 
-    ranked_predictions_path = os.path.join(output_dir, f"{prefix}_ranked_predictions.csv")
+    ranked_predictions_path = os.path.join(
+        output_dir,
+        f"{prefix}_ranked_predictions.csv",
+    )
     pred_df.to_csv(ranked_predictions_path, index=False)
 
     topk_df = calculate_topk_metrics(
@@ -502,23 +543,41 @@ def save_ranking_outputs(
         k_values=(100, 500, 1000),
     )
 
-    topk_metrics_path = os.path.join(output_dir, f"{prefix}_topk_metrics.csv")
+    topk_metrics_path = os.path.join(
+        output_dir,
+        f"{prefix}_topk_metrics.csv",
+    )
     topk_df.to_csv(topk_metrics_path, index=False)
 
     threshold_df = threshold_sweep(pred_df)
 
-    threshold_metrics_path = os.path.join(output_dir, f"{prefix}_threshold_sweep_metrics.csv")
+    threshold_metrics_path = os.path.join(
+        output_dir,
+        f"{prefix}_threshold_sweep_metrics.csv",
+    )
     threshold_df.to_csv(threshold_metrics_path, index=False)
 
-    # Confusion matrix using the default model prediction, equivalent to argmax
     y_true = pred_df["y_true"].tolist()
-    y_pred_default = pred_df["y_pred_default"].tolist()
+    y_pred_default = pred_df["y_pred_threshold_0.50"].tolist()
     default_metrics = compute_basic_metrics(y_true, y_pred_default)
+    default_metrics["threshold"] = 0.50
 
-    confusion_matrix_path = os.path.join(output_dir, f"{prefix}_confusion_matrix.csv")
-    confusion_matrix_df = save_confusion_matrix(default_metrics, confusion_matrix_path)
+    confusion_matrix_path = os.path.join(
+        output_dir,
+        f"{prefix}_confusion_matrix_threshold_0.50.csv",
+    )
+    confusion_matrix_df = save_confusion_matrix(
+        default_metrics,
+        confusion_matrix_path,
+    )
 
-    print(f"\n{prefix} confusion matrix:")
+    default_metrics_path = os.path.join(
+        output_dir,
+        f"{prefix}_metrics_threshold_0.50.json",
+    )
+    save_metrics_json(default_metrics, default_metrics_path)
+
+    print(f"\n{prefix} confusion matrix at threshold 0.50:")
     print(confusion_matrix_df)
 
     print(f"\n{prefix} Top-K metrics:")
@@ -531,7 +590,8 @@ def save_ranking_outputs(
         "ranked_predictions_path": ranked_predictions_path,
         "topk_metrics_path": topk_metrics_path,
         "threshold_metrics_path": threshold_metrics_path,
-        "confusion_matrix_path": confusion_matrix_path,
+        "confusion_matrix_threshold_0.50_path": confusion_matrix_path,
+        "metrics_threshold_0.50_path": default_metrics_path,
     }
 
 
@@ -544,7 +604,10 @@ def count_labels(graphs):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train baseline GNN using graph structure only. No FPPool aggregation."
+        description=(
+            "Train baseline GNN using graph structure only. "
+            "Includes ranking metrics and threshold adjustment analysis."
+        )
     )
 
     parser.add_argument(
@@ -573,53 +636,14 @@ def main():
         help="Graph pooling method.",
     )
 
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=100,
-    )
-
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=32,
-    )
-
-    parser.add_argument(
-        "--hidden-dim",
-        type=int,
-        default=128,
-    )
-
-    parser.add_argument(
-        "--num-layers",
-        type=int,
-        default=3,
-    )
-
-    parser.add_argument(
-        "--dropout",
-        type=float,
-        default=0.2,
-    )
-
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=0.001,
-    )
-
-    parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=1e-5,
-    )
-
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-    )
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--num-layers", type=int, default=3)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument(
         "--no-class-weights",
@@ -628,12 +652,32 @@ def main():
     )
 
     parser.add_argument(
+        "--threshold-selection-metric",
+        default="f1",
+        choices=["f1", "precision", "recall", "balanced_accuracy", "specificity"],
+        help=(
+            "Metric used to select the best threshold on the validation set. "
+            "Default: f1."
+        ),
+    )
+
+    parser.add_argument(
+        "--min-recall-for-threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional minimum recall constraint when selecting threshold. "
+            "Example: 0.50 means select best threshold only among thresholds "
+            "with validation recall >= 0.50."
+        ),
+    )
+
+    parser.add_argument(
         "--save-full-dataset-ranking",
         action="store_true",
         help=(
             "Also rank all compounds in the full dataset. "
-            "Use this if you want to satisfy the request to rank all compounds, "
-            "but note that this includes training compounds."
+            "This includes training compounds, so label it clearly."
         ),
     )
 
@@ -724,7 +768,6 @@ def main():
     )
 
     if args.no_class_weights:
-        class_weights = None
         criterion = nn.CrossEntropyLoss()
         print("Using unweighted CrossEntropyLoss.")
     else:
@@ -741,7 +784,10 @@ def main():
 
         criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-        print(f"Using class weights: inactive={weight_inactive:.4f}, active={weight_active:.4f}")
+        print(
+            f"Using class weights: "
+            f"inactive={weight_inactive:.4f}, active={weight_active:.4f}"
+        )
 
     best_val_metric = -1.0
     best_epoch = 0
@@ -761,11 +807,13 @@ def main():
             device,
         )
 
+        # Training still uses threshold 0.50 for validation metric selection
         val_metrics = evaluate(
             model,
             val_loader,
             criterion,
             device,
+            threshold=0.50,
         )
 
         val_score = val_metrics["balanced_accuracy"]
@@ -805,19 +853,22 @@ def main():
             f"val_auc={val_metrics['roc_auc']}"
         )
 
-    print("\nLoading best model for final test evaluation...")
+    print("\nLoading best model for final evaluation...")
 
     checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    test_metrics = evaluate(
+    print("\nEvaluating test set at default threshold 0.50...")
+
+    test_metrics_default = evaluate(
         model,
         test_loader,
         criterion,
         device,
+        threshold=0.50,
     )
 
-    print("\nSaving ranking-based test outputs...")
+    print("\nSaving test ranking outputs...")
 
     test_active_rate = test_active / len(test_graphs)
 
@@ -829,6 +880,79 @@ def main():
         prefix="test",
         overall_active_rate=test_active_rate,
     )
+
+    print("\nRunning validation threshold sweep...")
+
+    val_pred_df = collect_predictions(
+        model=model,
+        loader=val_loader,
+        device=device,
+    )
+
+    val_threshold_df = threshold_sweep(val_pred_df)
+
+    val_threshold_sweep_path = os.path.join(
+        args.output,
+        "val_threshold_sweep_metrics.csv",
+    )
+    val_threshold_df.to_csv(val_threshold_sweep_path, index=False)
+
+    selected_threshold, selected_val_row = select_threshold_from_validation(
+        val_threshold_df,
+        metric=args.threshold_selection_metric,
+        min_recall=args.min_recall_for_threshold,
+    )
+
+    selected_threshold_info_path = os.path.join(
+        args.output,
+        "selected_threshold_from_validation.json",
+    )
+
+    selected_threshold_info = {
+        "selection_metric": args.threshold_selection_metric,
+        "min_recall_for_threshold": args.min_recall_for_threshold,
+        "selected_threshold": selected_threshold,
+        "selected_validation_row": selected_val_row,
+        "note": (
+            "Threshold was selected using validation set only, then applied to test set."
+        ),
+    }
+
+    save_metrics_json(selected_threshold_info, selected_threshold_info_path)
+
+    print("\nSelected threshold from validation set:")
+    print(json.dumps(selected_threshold_info, indent=2))
+
+    print("\nApplying selected threshold to test set...")
+
+    test_metrics_selected_threshold = evaluate(
+        model,
+        test_loader,
+        criterion,
+        device,
+        threshold=selected_threshold,
+    )
+
+    selected_test_metrics_path = os.path.join(
+        args.output,
+        "test_metrics_selected_threshold.json",
+    )
+    save_metrics_json(test_metrics_selected_threshold, selected_test_metrics_path)
+
+    selected_test_confusion_matrix_path = os.path.join(
+        args.output,
+        "test_confusion_matrix_selected_threshold.csv",
+    )
+    selected_test_confusion_matrix_df = save_confusion_matrix(
+        test_metrics_selected_threshold,
+        selected_test_confusion_matrix_path,
+    )
+
+    print("\nTest metrics using selected threshold:")
+    print(json.dumps(test_metrics_selected_threshold, indent=2))
+
+    print("\nTest confusion matrix using selected threshold:")
+    print(selected_test_confusion_matrix_df)
 
     full_dataset_output_paths = None
 
@@ -858,7 +982,9 @@ def main():
             "args": vars(args),
             "node_dim": node_dim,
             "edge_dim": edge_dim,
-            "test_metrics": test_metrics,
+            "test_metrics_default_threshold_0.50": test_metrics_default,
+            "test_metrics_selected_threshold": test_metrics_selected_threshold,
+            "selected_threshold": selected_threshold,
         },
         final_model_path,
     )
@@ -888,10 +1014,16 @@ def main():
         "overall_active_rate_test_set": test_active_rate,
         "best_epoch": best_epoch,
         "best_val_balanced_accuracy": best_val_metric,
-        "test_metrics": test_metrics,
+        "test_metrics_default_threshold_0.50": test_metrics_default,
+        "selected_threshold": selected_threshold,
+        "selected_threshold_info_path": selected_threshold_info_path,
+        "test_metrics_selected_threshold": test_metrics_selected_threshold,
         "best_model_path": best_model_path,
         "final_model_path": final_model_path,
         "history_path": history_path,
+        "val_threshold_sweep_path": val_threshold_sweep_path,
+        "selected_test_metrics_path": selected_test_metrics_path,
+        "selected_test_confusion_matrix_path": selected_test_confusion_matrix_path,
         "test_output_paths": test_output_paths,
         "full_dataset_output_paths": full_dataset_output_paths,
     }
@@ -905,15 +1037,16 @@ def main():
     print(f"Training history saved to: {history_path}")
     print(f"Summary saved to: {summary_path}")
 
-    print("\nTest metrics:")
-    print(json.dumps(test_metrics, indent=2))
-
-    print("\nSaved test output files:")
-    print(json.dumps(test_output_paths, indent=2))
+    print("\nImportant output files:")
+    print(f"Test Top-K metrics: {test_output_paths['topk_metrics_path']}")
+    print(f"Test threshold sweep: {test_output_paths['threshold_metrics_path']}")
+    print(f"Validation threshold sweep: {val_threshold_sweep_path}")
+    print(f"Selected threshold info: {selected_threshold_info_path}")
+    print(f"Selected-threshold test metrics: {selected_test_metrics_path}")
+    print(f"Selected-threshold confusion matrix: {selected_test_confusion_matrix_path}")
 
     if full_dataset_output_paths is not None:
-        print("\nSaved full-dataset output files:")
-        print(json.dumps(full_dataset_output_paths, indent=2))
+        print(f"Full-dataset Top-K metrics: {full_dataset_output_paths['topk_metrics_path']}")
 
 
 if __name__ == "__main__":
