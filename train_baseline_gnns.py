@@ -40,7 +40,84 @@ from torch_geometric.nn import (
     global_mean_pool,
 )
 
+# ---------------------------------------------------------------------
+# Reproducibility and JSON helpers
+# ---------------------------------------------------------------------
 
+
+def set_seed(seed: int) -> None:
+    """
+    Set random seeds for reproducible train/validation/test splitting
+    and model initialization.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    # More deterministic behavior.
+    # This can make training slightly slower, but helps reproducibility.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def to_jsonable(obj):
+    """
+    Convert numpy/pandas/torch objects into JSON-safe Python objects.
+    """
+    if isinstance(obj, dict):
+        return {str(k): to_jsonable(v) for k, v in obj.items()}
+
+    if isinstance(obj, list):
+        return [to_jsonable(v) for v in obj]
+
+    if isinstance(obj, tuple):
+        return [to_jsonable(v) for v in obj]
+
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+
+    if isinstance(obj, torch.Tensor):
+        if obj.numel() == 1:
+            return obj.detach().cpu().item()
+        return obj.detach().cpu().tolist()
+
+    if isinstance(obj, np.integer):
+        return int(obj)
+
+    if isinstance(obj, np.floating):
+        value = float(obj)
+        if math.isnan(value):
+            return None
+        if math.isinf(value):
+            return None
+        return value
+
+    if isinstance(obj, float):
+        if math.isnan(obj):
+            return None
+        if math.isinf(obj):
+            return None
+        return obj
+
+    if isinstance(obj, pd.Series):
+        return obj.tolist()
+
+    if isinstance(obj, pd.DataFrame):
+        return obj.to_dict(orient="records")
+
+    return obj
+
+
+def save_metrics_json(metrics: Dict[str, Any], output_path: str) -> None:
+    """
+    Save metric dictionary as JSON after converting non-JSON-safe objects.
+    """
+    with open(output_path, "w") as f:
+        json.dump(to_jsonable(metrics), f, indent=2)
 # ---------------------------------------------------------------------
 # Stored fingerprint helpers
 # ---------------------------------------------------------------------
