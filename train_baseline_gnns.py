@@ -1,32 +1,18 @@
-#!/usr/bin/env python3
-
 """
-Train a baseline GNN with OPTIONAL molecular fingerprints.
+Train a baseline GNN using fingerprints already stored in PyG graphs.
 
-This script supports two modes:
+This version is tailored to the preprocessing workflow where FPPool creates
+PyTorch Geometric Data objects and saves the fingerprint vector as data.fp.
 
-1) Graph-only baseline:
-   --fp-type none
 
-2) Graph + fingerprint model:
-   --fp-type MorganFP
-   --fp-type RdkitFP
-   --fp-type MACCSFP
-   --fp-type PatternFP
-   --fp-type AtomPairFP
-   --fp-type TopologicalTorsionFP
+Threshold handling:
+- The best epoch is selected using validation performance.
+- The classification threshold is selected using validation predictions only.
+- The selected validation threshold is then applied once to the test set.
+- The test threshold sweep is saved only for reporting/sensitivity analysis;
+  it is not used to choose the final threshold.
 
-For fingerprint mode, the model does this:
-
-    molecular graph -> GNN -> graph_embedding
-    SMILES -> RDKit fingerprint -> fp_vector
-    concatenate(graph_embedding, fp_vector) -> classifier
-
-So this is a real "GIN + MorganFP" / "GCN + RdkitFP" style baseline.
-
-Important:
-- MorganFP/RdkitFP/etc. are computed from each graph's SMILES unless you use --fp-source stored.
-- Your PyG Data objects must contain g.smiles or g.original_smiles for computed fingerprints.
+Notes:
 - GCN and GIN do not use edge_attr.
 - GINE uses edge_attr.
 """
@@ -56,393 +42,105 @@ from torch_geometric.nn import (
 
 
 # ---------------------------------------------------------------------
-# Optional RDKit imports
+# Stored fingerprint helpers
 # ---------------------------------------------------------------------
 
 
-try:
-    from rdkit import Chem
-    from rdkit import DataStructs
-    from rdkit import RDLogger
-    from rdkit.Chem import AllChem, MACCSkeys
-    from rdkit.Chem import rdMolDescriptors
-
-    RDLogger.DisableLog("rdApp.warning")
-    RDKIT_AVAILABLE = True
-except Exception:
-    Chem = None
-    AllChem = None
-    MACCSkeys = None
-    DataStructs = None
-    rdMolDescriptors = None
-    RDKIT_AVAILABLE = False
-
-
-# ---------------------------------------------------------------------
-# Reproducibility and JSON helpers
-# ---------------------------------------------------------------------
+def infer_fp_name_from_path(path: str) -> str:
+    """Infer a human-readable fingerprint label from the graph path for logs only."""
+    lower = str(path).lower()
+    if "morgan" in lower:
+        return "MorganFP"
+    if "rdkit" in lower:
+        return "RdkitFP"
+    if "maccs" in lower:
+        return "MACCSFP"
+    if "estate" in lower:
+        return "EstateFP"
+    if "pubchem" in lower:
+        return "PubChemFP"
+    if "rgroup" in lower:
+        return "RGroupFP"
+    if "fragment" in lower:
+        return "FragmentFP"
+    return "stored_data_fp"
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def to_jsonable(obj: Any) -> Any:
-    if isinstance(obj, dict):
-        return {str(k): to_jsonable(v) for k, v in obj.items()}
-
-    if isinstance(obj, list):
-        return [to_jsonable(v) for v in obj]
-
-    if isinstance(obj, tuple):
-        return [to_jsonable(v) for v in obj]
-
-    if isinstance(obj, torch.Tensor):
-        if obj.numel() == 1:
-            return obj.detach().cpu().item()
-        return obj.detach().cpu().tolist()
-
-    if hasattr(obj, "item"):
-        try:
-            return obj.item()
-        except Exception:
-            pass
-
-    try:
-        if pd.isna(obj):
-            return None
-    except Exception:
-        pass
-
-    return obj
-
-
-def save_metrics_json(metrics: Dict[str, Any], output_path: str) -> None:
-    with open(output_path, "w") as f:
-        json.dump(to_jsonable(metrics), f, indent=2)
-
-
-# ---------------------------------------------------------------------
-# Fingerprint helpers
-# ---------------------------------------------------------------------
-
-
-SUPPORTED_FP_TYPES = [
-    "none",
-    "MorganFP",
-    "RdkitFP",
-    "MACCSFP",
-    "PatternFP",
-    "AtomPairFP",
-    "TopologicalTorsionFP",
-]
-
-
-def bitvect_to_tensor(bitvect) -> torch.Tensor:
+def attach_stored_fppool_fingerprints(graphs: List, use_fp: bool = True) -> Tuple[List, Optional[int], Dict[str, Any]]:
     """
-    Convert an RDKit ExplicitBitVect/SparseBitVect into a float tensor.
+    Use fingerprints already saved in each PyG Data object as data.fp.
 
-    Important fix:
-    DataStructs.ConvertToNumpyArray expects a NumPy array, not a Python list.
+    Your preprocessing script creates FPPool graphs and saves the chosen
+    fingerprint type inside data.fp. Therefore training does not need to know
+    whether data.fp came from MorganFP or RdkitFP; it only needs the vector.
     """
-    arr = np.zeros((int(bitvect.GetNumBits()),), dtype=np.float32)
-    DataStructs.ConvertToNumpyArray(bitvect, arr)
-    return torch.from_numpy(arr).float().view(1, -1)
-
-
-def get_smiles_from_graph(g) -> Optional[str]:
-    """
-    Try common attributes that may contain SMILES.
-    """
-    for attr in ["smiles", "original_smiles", "canonical_smiles"]:
-        if hasattr(g, attr):
-            value = getattr(g, attr)
-
-            if value is None:
-                continue
-
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-
-            if isinstance(value, (list, tuple)) and len(value) > 0:
-                if isinstance(value[0], str) and value[0].strip():
-                    return value[0].strip()
-
-    return None
-
-
-def compute_rdkit_fingerprint(
-    smiles: str,
-    fp_type: str,
-    fp_bits: int = 2048,
-    morgan_radius: int = 2,
-) -> Optional[torch.Tensor]:
-    """
-    Compute selected RDKit fingerprint from SMILES.
-
-    Returns tensor with shape [1, fp_dim].
-    """
-    if fp_type == "none":
-        return None
-
-    if not RDKIT_AVAILABLE:
-        raise ImportError(
-            "RDKit is required to compute fingerprints. "
-            "Install with: conda install -c conda-forge rdkit"
-        )
-
-    mol = Chem.MolFromSmiles(smiles)
-
-    if mol is None:
-        return None
-
-    fp_type = fp_type.strip()
-
-    if fp_type == "MorganFP":
-        bitvect = AllChem.GetMorganFingerprintAsBitVect(
-            mol,
-            radius=morgan_radius,
-            nBits=fp_bits,
-        )
-
-    elif fp_type == "RdkitFP":
-        bitvect = Chem.RDKFingerprint(
-            mol,
-            fpSize=fp_bits,
-        )
-
-    elif fp_type == "MACCSFP":
-        bitvect = MACCSkeys.GenMACCSKeys(mol)
-
-    elif fp_type == "PatternFP":
-        bitvect = Chem.PatternFingerprint(
-            mol,
-            fpSize=fp_bits,
-        )
-
-    elif fp_type == "AtomPairFP":
-        bitvect = rdMolDescriptors.GetHashedAtomPairFingerprintAsBitVect(
-            mol,
-            nBits=fp_bits,
-        )
-
-    elif fp_type == "TopologicalTorsionFP":
-        bitvect = rdMolDescriptors.GetHashedTopologicalTorsionFingerprintAsBitVect(
-            mol,
-            nBits=fp_bits,
-        )
-
-    else:
-        raise ValueError(
-            f"Unsupported fp_type={fp_type}. "
-            f"Supported: {SUPPORTED_FP_TYPES}"
-        )
-
-    return bitvect_to_tensor(bitvect)
-
-
-def _tensorize_stored_fp(value) -> Optional[torch.Tensor]:
-    """
-    Convert a stored fingerprint attribute into shape [1, fp_dim].
-    """
-    if value is None:
-        return None
-
-    if isinstance(value, torch.Tensor):
-        fp = value.detach().clone().float()
-    else:
-        fp = torch.tensor(value, dtype=torch.float)
-
-    if fp.numel() == 0:
-        return None
-
-    fp = fp.view(1, -1)
-    return fp
-
-
-def get_stored_fingerprint_from_graph(g, fp_type: str) -> Optional[torch.Tensor]:
-    """
-    Try to find a precomputed fingerprint already stored in the PyG Data object.
-    """
-    fp_type_lower = fp_type.lower()
-
-    candidate_attrs = [
-        "fp",
-        "fingerprint",
-        "fingerprints",
-        "fp_vector",
-        "fp_vec",
-        "fp_bits",
-        "morgan_fp",
-        "rdkit_fp",
-        "maccs_fp",
-        fp_type,
-        fp_type_lower,
-    ]
-
-    if fp_type == "MorganFP":
-        candidate_attrs = [
-            "morgan_fp",
-            "MorganFP",
-            "morgan",
-            "fp",
-            "fingerprint",
-        ] + candidate_attrs
-    elif fp_type == "RdkitFP":
-        candidate_attrs = [
-            "rdkit_fp",
-            "RdkitFP",
-            "rdkit",
-            "fp",
-            "fingerprint",
-        ] + candidate_attrs
-    elif fp_type == "MACCSFP":
-        candidate_attrs = [
-            "maccs_fp",
-            "MACCSFP",
-            "maccs",
-            "fp",
-            "fingerprint",
-        ] + candidate_attrs
-
-    seen = set()
-    unique_attrs = []
-
-    for attr in candidate_attrs:
-        if attr not in seen:
-            unique_attrs.append(attr)
-            seen.add(attr)
-
-    for attr in unique_attrs:
-        if hasattr(g, attr):
-            fp = _tensorize_stored_fp(getattr(g, attr))
-            if fp is not None:
-                return fp
-
-    return None
-
-
-def attach_fingerprints_to_graphs(
-    graphs: List,
-    fp_type: str,
-    fp_source: str = "compute",
-    fp_bits: int = 2048,
-    morgan_radius: int = 2,
-) -> Tuple[List, Optional[int], Dict[str, Any]]:
-    """
-    Attach g.fp to every graph.
-
-    fp_type:
-      - none: no fingerprint is attached
-      - MorganFP/RdkitFP/etc.: attach selected fingerprint
-
-    fp_source:
-      - compute: compute from SMILES using RDKit
-      - stored: read existing fingerprint attribute from Data object
-      - auto: try stored first, then compute from SMILES
-    """
-    if fp_type == "none":
+    if not use_fp:
+        for g in graphs:
+            if hasattr(g, "fp"):
+                # Keep the original attribute in the graph object, but the model
+                # will ignore it because fp_dim is None.
+                pass
         return graphs, None, {
-            "fp_type": fp_type,
-            "fp_source": fp_source,
+            "use_fingerprint": False,
+            "source_attribute": None,
             "fp_dim": None,
-            "computed": 0,
-            "loaded_stored": 0,
-            "skipped_missing_fp": 0,
+            "graphs_with_fp": 0,
+            "graphs_missing_fp": len(graphs),
+            "graphs_after_fp_filtering": len(graphs),
         }
-
-    if fp_type not in SUPPORTED_FP_TYPES:
-        raise ValueError(f"Unsupported fp_type={fp_type}. Supported: {SUPPORTED_FP_TYPES}")
-
-    if fp_source not in ["compute", "stored", "auto"]:
-        raise ValueError("--fp-source must be one of: compute, stored, auto")
 
     cleaned = []
     skipped = 0
-    computed = 0
-    loaded_stored = 0
     fp_dim = None
 
     for idx, g in enumerate(graphs):
-        fp = None
-
-        if fp_source in ["stored", "auto"]:
-            fp = get_stored_fingerprint_from_graph(g, fp_type)
-            if fp is not None:
-                loaded_stored += 1
-
-        if fp is None and fp_source in ["compute", "auto"]:
-            smiles = get_smiles_from_graph(g)
-
-            if smiles is None:
-                print(
-                    f"Skipping graph {idx}: cannot compute {fp_type}; "
-                    "no smiles/original_smiles/canonical_smiles attribute found."
-                )
-                skipped += 1
-                continue
-
-            fp = compute_rdkit_fingerprint(
-                smiles=smiles,
-                fp_type=fp_type,
-                fp_bits=fp_bits,
-                morgan_radius=morgan_radius,
-            )
-
-            if fp is None:
-                print(f"Skipping graph {idx}: RDKit failed to compute {fp_type} from SMILES.")
-                skipped += 1
-                continue
-
-            computed += 1
-
-        if fp is None:
-            print(f"Skipping graph {idx}: no fingerprint available for fp_type={fp_type}.")
+        if not hasattr(g, "fp") or getattr(g, "fp") is None:
+            print(f"Skipping graph {idx}: expected stored fingerprint at data.fp but it was missing.")
             skipped += 1
             continue
 
-        if fp.dim() != 2 or fp.shape[0] != 1:
-            fp = fp.view(1, -1)
+        fp = getattr(g, "fp")
 
+        if isinstance(fp, torch.Tensor):
+            fp = fp.detach().clone().float()
+        else:
+            fp = torch.tensor(fp, dtype=torch.float)
+
+        if fp.numel() == 0:
+            print(f"Skipping graph {idx}: data.fp is empty.")
+            skipped += 1
+            continue
+
+        fp = fp.view(1, -1)
         current_fp_dim = int(fp.shape[1])
 
         if fp_dim is None:
             fp_dim = current_fp_dim
         elif current_fp_dim != fp_dim:
             raise ValueError(
-                f"Inconsistent fingerprint dimensions. "
-                f"Expected {fp_dim}, got {current_fp_dim} at graph {idx}."
+                f"Inconsistent data.fp dimensions. Expected {fp_dim}, got {current_fp_dim} at graph {idx}."
             )
 
-        g.fp = fp.float()
+        g.fp = fp
         cleaned.append(g)
 
     if len(cleaned) == 0:
         raise ValueError(
-            f"No graphs left after attaching fingerprints. "
-            f"Check that your graphs contain SMILES or stored fingerprint attributes."
+            "No graphs contained stored fingerprints in data.fp. "
+            "Use the FPPool preprocessing script first, or rerun this training script with --no-fp for graph-only training."
         )
 
     stats = {
-        "fp_type": fp_type,
-        "fp_source": fp_source,
-        "fp_bits": fp_bits,
-        "morgan_radius": morgan_radius,
+        "use_fingerprint": True,
+        "source_attribute": "data.fp",
         "fp_dim": fp_dim,
-        "computed": computed,
-        "loaded_stored": loaded_stored,
-        "skipped_missing_fp": skipped,
+        "graphs_with_fp": len(cleaned),
+        "graphs_missing_fp": skipped,
         "graphs_after_fp_filtering": len(cleaned),
+        "note": "Training uses the fingerprint vector already stored as data.fp; it does not recompute fingerprints.",
     }
 
-    print("\nFingerprint attachment summary:")
+    print("\nStored fingerprint summary:")
     print(json.dumps(to_jsonable(stats), indent=2))
 
     return cleaned, fp_dim, stats
@@ -1034,23 +732,62 @@ def calculate_topk_metrics(
 
 
 def default_threshold_grid() -> List[float]:
-    very_low = [0.0005, 0.001, 0.002, 0.003, 0.005, 0.0075]
-    low = [round(i / 1000, 3) for i in range(10, 100)]  # 0.010 to 0.099
-    regular = [round(i / 100, 2) for i in range(10, 100)]  # 0.10 to 0.99
-    return sorted(set(very_low + low + regular))
+    """
+    Threshold grid for imbalanced activity prediction.
+
+    Includes very low thresholds, regular 0.01 steps, 0.50, and 1.00.
+    Threshold 1.00 is useful as the "almost nothing predicted active" endpoint.
+    """
+    very_low = [0.0, 0.0005, 0.001, 0.002, 0.005]
+    regular = [round(i / 100, 2) for i in range(1, 101)]
+    return sorted(set(very_low + regular))
+
+
+def parse_thresholds(text: Optional[str]) -> List[float]:
+    """
+    Parse a comma-separated threshold list.
+    Example: --thresholds 0.01,0.02,0.05,0.1,0.2,0.5
+    """
+    if text is None or str(text).strip() == "":
+        return default_threshold_grid()
+
+    thresholds = []
+    for token in str(text).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        value = float(token)
+        if value < 0.0 or value > 1.0:
+            raise ValueError(f"Threshold must be between 0 and 1, got {value}.")
+        thresholds.append(value)
+
+    if not thresholds:
+        raise ValueError("No valid thresholds were provided.")
+
+    return sorted(set(thresholds))
 
 
 def threshold_sweep(
     pred_df: pd.DataFrame,
     thresholds: Optional[Sequence[float]] = None,
 ) -> pd.DataFrame:
+    """
+    Compute precision/recall/F1/confusion-matrix values at each threshold.
+
+    This function does not select a threshold by itself. Use it on validation for
+    selection. Use it on test only for reporting/sensitivity analysis.
+    """
     if thresholds is None:
         thresholds = default_threshold_grid()
 
-    y_true = pred_df["y_true"].tolist()
+    if "y_true" not in pred_df.columns or "prob_active" not in pred_df.columns:
+        raise ValueError("pred_df must contain y_true and prob_active columns.")
+
+    y_true = pred_df["y_true"].astype(int).tolist()
     rows = []
 
     for threshold in thresholds:
+        threshold = float(threshold)
         y_pred = (pred_df["prob_active"] >= threshold).astype(int).tolist()
         metrics = compute_basic_metrics(y_true, y_pred)
 
@@ -1058,6 +795,7 @@ def threshold_sweep(
             {
                 "threshold": threshold,
                 "predicted_active": int(sum(y_pred)),
+                "predicted_inactive": int(len(y_pred) - sum(y_pred)),
                 **metrics,
             }
         )
@@ -1069,7 +807,29 @@ def select_threshold_from_validation(
     val_threshold_df: pd.DataFrame,
     metric: str = "f1",
     min_recall: float = 0.0,
+    tie_breaker: str = "higher_precision",
 ) -> Tuple[float, Dict[str, Any]]:
+    """
+    Select threshold using validation set only.
+
+    Ties are handled deterministically so that the same validation sweep always
+    gives the same threshold.
+    """
+    allowed_tie_breakers = [
+        "higher_precision",
+        "higher_recall",
+        "higher_balanced_accuracy",
+        "higher_threshold",
+        "lower_threshold",
+        "fewer_predicted_active",
+    ]
+
+    if tie_breaker not in allowed_tie_breakers:
+        raise ValueError(
+            f"Unsupported tie_breaker={tie_breaker}. "
+            f"Choose one of: {allowed_tie_breakers}"
+        )
+
     df = val_threshold_df.copy()
 
     if min_recall > 0:
@@ -1078,7 +838,7 @@ def select_threshold_from_validation(
     if len(df) == 0:
         print(
             f"No threshold satisfied min_recall={min_recall}. "
-            "Using all thresholds instead."
+            "Using all validation thresholds instead."
         )
         df = val_threshold_df.copy()
 
@@ -1088,10 +848,39 @@ def select_threshold_from_validation(
             f"Available columns: {df.columns.tolist()}"
         )
 
-    best_idx = df[metric].idxmax()
-    best_row = df.loc[best_idx]
+    max_metric = float(df[metric].max())
+    tied = df[np.isclose(df[metric].astype(float), max_metric, rtol=1e-12, atol=1e-12)].copy()
 
-    return float(best_row["threshold"]), best_row.to_dict()
+    ascending_map = {
+        "higher_precision": [False, False, False, True],
+        "higher_recall": [False, False, False, True],
+        "higher_balanced_accuracy": [False, False, False, True],
+        "higher_threshold": [False, False, True],
+        "lower_threshold": [True, False, True],
+        "fewer_predicted_active": [True, False, False],
+    }
+
+    if tie_breaker == "higher_precision":
+        sort_cols = ["precision", "recall", "balanced_accuracy", "predicted_active"]
+    elif tie_breaker == "higher_recall":
+        sort_cols = ["recall", "precision", "balanced_accuracy", "predicted_active"]
+    elif tie_breaker == "higher_balanced_accuracy":
+        sort_cols = ["balanced_accuracy", "precision", "recall", "predicted_active"]
+    elif tie_breaker == "higher_threshold":
+        sort_cols = ["threshold", "precision", "predicted_active"]
+    elif tie_breaker == "lower_threshold":
+        sort_cols = ["threshold", "recall", "predicted_active"]
+    else:
+        sort_cols = ["predicted_active", "precision", "threshold"]
+
+    tied = tied.sort_values(sort_cols, ascending=ascending_map[tie_breaker]).reset_index(drop=True)
+    best_row = tied.iloc[0]
+
+    best = best_row.to_dict()
+    best["num_tied_thresholds_for_selected_metric"] = int(len(tied))
+    best["tie_breaker"] = tie_breaker
+
+    return float(best_row["threshold"]), best
 
 
 def save_confusion_matrix(metrics: Dict[str, Any], output_path: str) -> pd.DataFrame:
@@ -1271,6 +1060,8 @@ def save_ranking_outputs(
     prefix: str,
     overall_active_rate: float,
     selected_threshold: Optional[float] = None,
+    thresholds: Optional[Sequence[float]] = None,
+    threshold_sweep_note: Optional[str] = None,
 ) -> Dict[str, str]:
     pred_df = collect_predictions(
         model=model,
@@ -1302,7 +1093,10 @@ def save_ranking_outputs(
     )
     topk_df.to_csv(topk_metrics_path, index=False)
 
-    threshold_df = threshold_sweep(pred_df)
+    threshold_df = threshold_sweep(pred_df, thresholds=thresholds)
+
+    if threshold_sweep_note is not None:
+        threshold_df.insert(1, "note", threshold_sweep_note)
 
     threshold_metrics_path = os.path.join(
         output_dir,
@@ -1357,8 +1151,8 @@ def save_ranking_outputs(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Train baseline GNN with optional molecular fingerprints. "
-            "Includes Top-K metrics and threshold adjustment analysis."
+            "Train baseline GNN using stored data.fp fingerprints when present. "
+            "Includes Top-K metrics and validation-only threshold adjustment analysis."
         )
     )
 
@@ -1389,42 +1183,19 @@ def main() -> None:
     )
 
     parser.add_argument(
-        "--fp-type",
-        default="none",
-        choices=SUPPORTED_FP_TYPES,
-        help=(
-            "Fingerprint type. Use 'none' for graph-only baseline. "
-            "Use MorganFP/RdkitFP/MACCSFP/etc. for graph + fingerprint model."
-        ),
+        "--no-fp",
+        action="store_true",
+        help="Ignore stored data.fp and train a graph-only baseline.",
     )
 
     parser.add_argument(
-        "--fp-source",
-        default="compute",
-        choices=["compute", "stored", "auto"],
+        "--fp-name",
+        default=None,
         help=(
-            "How to get fingerprint vectors. "
-            "'compute' computes from SMILES using RDKit. "
-            "'stored' reads an existing Data attribute. "
-            "'auto' tries stored first, then computes from SMILES."
+            "Optional label for the stored fingerprint in output summaries, e.g. MorganFP or RdkitFP. "
+            "This does not change the data; training always reads data.fp unless --no-fp is used. "
+            "If omitted, the script guesses from the graph path."
         ),
-    )
-
-    parser.add_argument(
-        "--fp-bits",
-        type=int,
-        default=2048,
-        help=(
-            "Fingerprint bit length for MorganFP, RdkitFP, PatternFP, AtomPairFP, "
-            "and TopologicalTorsionFP. Ignored for MACCSFP."
-        ),
-    )
-
-    parser.add_argument(
-        "--morgan-radius",
-        type=int,
-        default=2,
-        help="Morgan fingerprint radius. Radius 2 is ECFP4-like.",
     )
 
     parser.add_argument("--epochs", type=int, default=100)
@@ -1483,6 +1254,33 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--thresholds",
+        default=None,
+        help=(
+            "Optional comma-separated thresholds to evaluate. "
+            "Default uses an imbalanced-data grid from 0.0 to 1.0, "
+            "including very low thresholds such as 0.001, 0.002, and 0.005."
+        ),
+    )
+
+    parser.add_argument(
+        "--threshold-tie-breaker",
+        default="higher_precision",
+        choices=[
+            "higher_precision",
+            "higher_recall",
+            "higher_balanced_accuracy",
+            "higher_threshold",
+            "lower_threshold",
+            "fewer_predicted_active",
+        ],
+        help=(
+            "Tie-breaker if multiple validation thresholds have the same selected metric. "
+            "Default higher_precision is conservative for imbalanced datasets."
+        ),
+    )
+
+    parser.add_argument(
         "--save-full-dataset-ranking",
         action="store_true",
         help=(
@@ -1508,35 +1306,32 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    use_fp = not args.no_fp
+    fp_name = args.fp_name if args.fp_name else infer_fp_name_from_path(args.graphs)
+
     print(f"Using device: {device}")
     print(f"GNN type: {args.gnn_type}")
     print(f"Pooling: {args.pooling}")
-    print(f"FP type: {args.fp_type}")
-    print(f"FP source: {args.fp_source}")
-    print(f"FP bits: {args.fp_bits}")
-    print(f"Morgan radius: {args.morgan_radius}")
+    print(f"Use stored data.fp: {use_fp}")
+    print(f"Fingerprint label for outputs: {fp_name if use_fp else 'none'}")
     print(f"Model-selection metric: {args.model_selection_metric}")
     print(f"Threshold-selection metric: {args.threshold_selection_metric}")
     print(f"Minimum recall for threshold selection: {args.min_recall_for_threshold}")
+    print(f"Threshold tie-breaker: {args.threshold_tie_breaker}")
+    threshold_grid = parse_thresholds(args.thresholds)
+    print(f"Number of thresholds evaluated: {len(threshold_grid)}")
+    print(f"Threshold grid: {threshold_grid}")
     print(f"Num workers: {args.num_workers}")
-
-    if args.fp_type != "none" and args.fp_source in ["compute", "auto"] and not RDKIT_AVAILABLE:
-        raise ImportError(
-            "RDKit is required for computed fingerprints. "
-            "Install with: conda install -c conda-forge rdkit"
-        )
 
     graphs = load_graphs(args.graphs)
 
     node_dim, edge_dim = infer_dimensions_and_validate_graphs(graphs)
 
-    graphs, fp_dim, fp_stats = attach_fingerprints_to_graphs(
+    graphs, fp_dim, fp_stats = attach_stored_fppool_fingerprints(
         graphs=graphs,
-        fp_type=args.fp_type,
-        fp_source=args.fp_source,
-        fp_bits=args.fp_bits,
-        morgan_radius=args.morgan_radius,
+        use_fp=use_fp,
     )
+    fp_stats["fingerprint_label"] = fp_name if use_fp else "none"
 
     inactive, active = count_labels(graphs)
 
@@ -1560,13 +1355,13 @@ def main() -> None:
             "Use GINE if you want the model to use bond/edge features."
         )
 
-    if args.fp_type != "none":
+    if use_fp:
         print(
-            f"Model mode: {args.gnn_type} + {args.fp_type}. "
-            "The classifier input is concatenate(graph_embedding, fingerprint_vector)."
+            f"Model mode: {args.gnn_type} + stored {fp_name}. "
+            "The classifier input is concatenate(graph_embedding, data.fp)."
         )
     else:
-        print(f"Model mode: graph-only {args.gnn_type}; no fingerprint vector is used.")
+        print(f"Model mode: graph-only {args.gnn_type}; stored data.fp is ignored.")
 
     train_graphs, val_graphs, test_graphs = stratified_split(
         graphs,
@@ -1794,7 +1589,7 @@ def main() -> None:
     )
     val_pred_df.to_csv(val_ranked_predictions_path, index=False)
 
-    val_threshold_df = threshold_sweep(val_pred_df)
+    val_threshold_df = threshold_sweep(val_pred_df, thresholds=threshold_grid)
 
     val_threshold_sweep_path = os.path.join(
         args.output,
@@ -1806,6 +1601,7 @@ def main() -> None:
         val_threshold_df,
         metric=args.threshold_selection_metric,
         min_recall=args.min_recall_for_threshold,
+        tie_breaker=args.threshold_tie_breaker,
     )
 
     selected_threshold_info_path = os.path.join(
@@ -1816,6 +1612,8 @@ def main() -> None:
     selected_threshold_info = {
         "selection_metric": args.threshold_selection_metric,
         "min_recall_for_threshold": args.min_recall_for_threshold,
+        "threshold_tie_breaker": args.threshold_tie_breaker,
+        "threshold_grid": threshold_grid,
         "selected_threshold": selected_threshold,
         "selected_validation_row": selected_val_row,
         "note": (
@@ -1902,6 +1700,8 @@ def main() -> None:
         prefix="test",
         overall_active_rate=test_active_rate,
         selected_threshold=selected_threshold,
+        thresholds=threshold_grid,
+        threshold_sweep_note="REPORT_ONLY_DO_NOT_SELECT_THRESHOLD_ON_TEST",
     )
 
     full_dataset_output_paths = None
@@ -1926,6 +1726,8 @@ def main() -> None:
             prefix="full_dataset",
             overall_active_rate=full_active_rate,
             selected_threshold=selected_threshold,
+            thresholds=threshold_grid,
+            threshold_sweep_note="REPORT_ONLY_FULL_DATASET_INCLUDES_TRAINING_COMPOUNDS",
         )
 
     torch.save(
@@ -1955,10 +1757,13 @@ def main() -> None:
         "graphs": args.graphs,
         "gnn_type": args.gnn_type,
         "pooling": args.pooling,
-        "fp_type": args.fp_type,
-        "fp_source": args.fp_source,
-        "fp_bits": args.fp_bits,
-        "morgan_radius": args.morgan_radius,
+        "use_fingerprint": use_fp,
+        "fingerprint_label": fp_name if use_fp else "none",
+        "fingerprint_source_attribute": "data.fp" if use_fp else None,
+        "threshold_selection_metric": args.threshold_selection_metric,
+        "min_recall_for_threshold": args.min_recall_for_threshold,
+        "threshold_tie_breaker": args.threshold_tie_breaker,
+        "threshold_grid": threshold_grid,
         "fp_dim": fp_dim,
         "fp_stats": fp_stats,
         "node_dim": node_dim,
@@ -2000,8 +1805,8 @@ def main() -> None:
         "full_dataset_output_paths": full_dataset_output_paths,
         "model_description": (
             "This model encodes molecular graph structure with a GNN. "
-            "If fp_type is not none, it concatenates the graph embedding with "
-            "the selected fingerprint vector before classification."
+            "By default it concatenates the graph embedding with the stored data.fp vector. "
+            "If --no-fp is used, it trains graph-only."
         ),
     }
 
@@ -2025,12 +1830,12 @@ def main() -> None:
     print(f"Selected-threshold confusion matrix: {selected_test_confusion_matrix_path}")
     print(f"Test ranked predictions: {test_output_paths['ranked_predictions_path']}")
     print(f"Test Top-K metrics: {test_output_paths['topk_metrics_path']}")
-    print(f"Test threshold sweep: {test_output_paths['threshold_metrics_path']}")
+    print(f"Test threshold sweep/report only: {test_output_paths['threshold_metrics_path']}")
 
     if full_dataset_output_paths is not None:
         print(f"Full-dataset ranked predictions: {full_dataset_output_paths['ranked_predictions_path']}")
         print(f"Full-dataset Top-K metrics: {full_dataset_output_paths['topk_metrics_path']}")
-        print(f"Full-dataset threshold sweep: {full_dataset_output_paths['threshold_metrics_path']}")
+        print(f"Full-dataset threshold sweep/report only: {full_dataset_output_paths['threshold_metrics_path']}")
 
 
 if __name__ == "__main__":
