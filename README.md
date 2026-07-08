@@ -379,31 +379,9 @@ Because the dataset is highly imbalanced, balanced accuracy, recall, ROC-AUC, an
 - FPPool is used for fingerprint-guided graph pooling.
 - GINE requires edge attributes, while GCN and GIN can run without using edge attributes directly.
 
-## Known File Naming Note
 
-The shell script `run_baseline_gnn.sh` calls:
-
-```bash
-python train_baseline_gnn.py
-```
-
-However, the repository file is named:
-
-```bash
-train_baseline_gnns.py
-```
-
-If needed, update the shell script command to:
-
-```bash
-python train_baseline_gnns.py
-```
 
 ## License
 
 This project is licensed under the MIT License.
 
-## Author
-
-Zhangbin Cai  
-McGill University
